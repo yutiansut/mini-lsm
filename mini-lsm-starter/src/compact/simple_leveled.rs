@@ -1,6 +1,8 @@
-use crate::lsm_storage::LsmStorageState;
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
+
+use crate::lsm_storage::LsmStorageState;
 
 #[derive(Debug, Clone)]
 pub struct SimpleLeveledCompactionOptions {
@@ -70,6 +72,7 @@ impl SimpleLeveledCompactionController {
         }
         None
     }
+
     /// Apply the compaction result.
     ///
     /// The compactor will call this function with the compaction task and the list of SST ids generated. This function applies the

@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use anyhow::Result;
 
 use super::StorageIterator;
@@ -11,7 +8,6 @@ pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
     choose_a: bool,
-    // Add fields as need
 }
 
 impl<
@@ -35,6 +31,7 @@ impl<
         }
         Ok(())
     }
+
     pub fn create(a: A, b: B) -> Result<Self> {
         let mut iter = Self {
             choose_a: false,
@@ -54,10 +51,12 @@ impl<
 {
     type KeyType<'a> = A::KeyType<'a>;
 
-    fn key(&self) -> Self::KeyType<'_> {
+    fn key(&self) -> A::KeyType<'_> {
         if self.choose_a {
+            debug_assert!(self.a.is_valid());
             self.a.key()
         } else {
+            debug_assert!(self.b.is_valid());
             self.b.key()
         }
     }
@@ -69,6 +68,7 @@ impl<
             self.b.value()
         }
     }
+
     fn is_valid(&self) -> bool {
         if self.choose_a {
             self.a.is_valid()

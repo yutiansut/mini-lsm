@@ -19,7 +19,7 @@ use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::lsm_storage::{CompactionFilter, LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -74,7 +74,6 @@ impl CompactionController {
         task: &CompactionTask,
         output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        println!("task {:#?}", task);
         match (self, task) {
             (CompactionController::Leveled(ctrl), CompactionTask::Leveled(task)) => {
                 ctrl.apply_compaction_result(snapshot, task, output)
@@ -85,7 +84,6 @@ impl CompactionController {
             (CompactionController::Tiered(ctrl), CompactionTask::Tiered(task)) => {
                 ctrl.apply_compaction_result(snapshot, task, output)
             }
-
             _ => unreachable!(),
         }
     }
@@ -121,31 +119,77 @@ impl LsmStorageInner {
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut builder = None;
         let mut new_sst = Vec::new();
-
-        while iter.is_valid() {
+        let watermark = self.mvcc().watermark();
+        let mut last_key = Vec::<u8>::new();
+        let mut first_key_below_watermark = false;
+        let compaction_filters = self.compaction_filters.lock().clone();
+        'outer: while iter.is_valid() {
             if builder.is_none() {
                 builder = Some(SsTableBuilder::new(self.options.block_size));
             }
-            let builder_inner = builder.as_mut().unwrap();
-            if compact_to_bottom_level {
-                if !iter.value().is_empty() {
-                    builder_inner.add(iter.key(), iter.value());
-                }
-            } else {
-                builder_inner.add(iter.key(), iter.value());
-            }
-            iter.next()?;
 
-            if builder_inner.estimated_size() >= self.options.target_sst_size {
+            let same_as_last_key = iter.key().key_ref() == last_key;
+            if !same_as_last_key {
+                first_key_below_watermark = true;
+            }
+
+            if compact_to_bottom_level
+                && !same_as_last_key
+                && iter.key().ts() <= watermark
+                && iter.value().is_empty()
+            {
+                last_key.clear();
+                last_key.extend(iter.key().key_ref());
+                iter.next()?;
+                first_key_below_watermark = false;
+                continue;
+            }
+
+            if iter.key().ts() <= watermark {
+                if same_as_last_key && !first_key_below_watermark {
+                    iter.next()?;
+                    continue;
+                }
+
+                first_key_below_watermark = false;
+
+                if !compaction_filters.is_empty() {
+                    for filter in &compaction_filters {
+                        match filter {
+                            CompactionFilter::Prefix(x) => {
+                                if iter.key().key_ref().starts_with(x) {
+                                    iter.next()?;
+                                    continue 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let builder_inner = builder.as_mut().unwrap();
+
+            if builder_inner.estimated_size() >= self.options.target_sst_size && !same_as_last_key {
                 let sst_id = self.next_sst_id();
-                let builder = builder.take().unwrap();
-                let sst = Arc::new(builder.build(
+                let old_builder = builder.take().unwrap();
+                let sst = Arc::new(old_builder.build(
                     sst_id,
                     Some(self.block_cache.clone()),
                     self.path_of_sst(sst_id),
                 )?);
                 new_sst.push(sst);
+                builder = Some(SsTableBuilder::new(self.options.block_size));
             }
+
+            let builder_inner = builder.as_mut().unwrap();
+            builder_inner.add(iter.key(), iter.value());
+
+            if !same_as_last_key {
+                last_key.clear();
+                last_key.extend(iter.key().key_ref());
+            }
+
+            iter.next()?;
         }
         if let Some(builder) = builder {
             let sst_id = self.next_sst_id(); // lock dropped here
@@ -252,12 +296,9 @@ impl LsmStorageInner {
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
-        // 功能和流程
-        // 检查压缩选项：首先，通过模式匹配检查self.options.compaction_options是否为CompactionOptions::NoCompaction。如果不是，函数将panic，因为该函数仅在未启用压缩的情况下被允许调用。
         let CompactionOptions::NoCompaction = self.options.compaction_options else {
             panic!("full compaction can only be called with compaction is not enabled")
         };
-        // 获取快照：然后，从当前状态（self.state）获取数据库的快照，包括L0层和L1层的SSTable信息。
 
         let snapshot = {
             let state = self.state.read();
@@ -266,19 +307,15 @@ impl LsmStorageInner {
 
         let l0_sstables = snapshot.l0_sstables.clone();
         let l1_sstables = snapshot.levels[0].1.clone();
-        // 创建压缩任务：基于L0和L1层的SSTable信息，创建一个CompactionTask::ForceFullCompaction任务。
-
         let compaction_task = CompactionTask::ForceFullCompaction {
             l0_sstables: l0_sstables.clone(),
             l1_sstables: l1_sstables.clone(),
         };
 
         println!("force full compaction: {:?}", compaction_task);
-        // 执行压缩：调用compact方法执行压缩任务，并获取压缩后的新SSTable信息。
+
         let sstables = self.compact(&compaction_task)?;
         let mut ids = Vec::with_capacity(sstables.len());
-
-        // 更新状态：在持有状态锁的情况下，更新数据库状态，包括移除旧的SSTables并添加新的SSTables。同时更新L0和L1层的SSTable信息。
 
         {
             let state_lock = self.state_lock.lock();
@@ -309,8 +346,6 @@ impl LsmStorageInner {
                 ManifestRecord::Compaction(compaction_task, ids.clone()),
             )?;
         }
-
-        // 同步目录和清理：同步目录状态到磁盘，并通过Manifest记录压缩操作。最后，删除所有参与压缩的旧SSTable文件。
         for sst in l0_sstables.iter().chain(l1_sstables.iter()) {
             std::fs::remove_file(self.path_of_sst(*sst))?;
         }
@@ -357,9 +392,7 @@ impl LsmStorageInner {
             *state = Arc::new(snapshot);
             drop(state);
             self.sync_dir()?;
-            self.manifest
-                .as_ref()
-                .unwrap()
+            self.manifest()
                 .add_record(&state_lock, ManifestRecord::Compaction(task, new_sst_ids))?;
             ssts_to_remove
         };
