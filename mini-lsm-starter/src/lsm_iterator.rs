@@ -1,15 +1,20 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-use crate::{
-    iterators::{merge_iterator::MergeIterator, StorageIterator},
-    mem_table::MemTableIterator,
-};
-use anyhow::{bail, Result};
-use bytes::Bytes;
 use std::ops::Bound;
 
+use anyhow::{bail, Result};
+use bytes::Bytes;
+
+use crate::iterators::concat_iterator::SstConcatIterator;
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::StorageIterator;
+use crate::mem_table::MemTableIterator;
+use crate::table::SsTableIterator;
+
 /// Represents the internal type for an LSM iterator. This type will be changed across the tutorial for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner = TwoMergeIterator<
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
+    MergeIterator<SstConcatIterator>,
+>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
@@ -28,13 +33,6 @@ impl LsmIterator {
         Ok(iter)
     }
 
-    fn move_to_non_delete(&mut self) -> Result<()> {
-        while self.is_valid() && self.inner.value().is_empty() {
-            self.next_inner()?;
-        }
-        Ok(())
-    }
-
     fn next_inner(&mut self) -> Result<()> {
         self.inner.next()?;
         if !self.inner.is_valid() {
@@ -48,6 +46,13 @@ impl LsmIterator {
         }
         Ok(())
     }
+
+    fn move_to_non_delete(&mut self) -> Result<()> {
+        while self.is_valid() && self.inner.value().is_empty() {
+            self.next_inner()?;
+        }
+        Ok(())
+    }
 }
 
 impl StorageIterator for LsmIterator {
@@ -56,6 +61,7 @@ impl StorageIterator for LsmIterator {
     fn is_valid(&self) -> bool {
         self.is_valid
     }
+
     fn key(&self) -> &[u8] {
         self.inner.key().raw_ref()
     }
@@ -69,6 +75,7 @@ impl StorageIterator for LsmIterator {
         self.move_to_non_delete()?;
         Ok(())
     }
+
     fn num_active_iterators(&self) -> usize {
         self.inner.num_active_iterators()
     }
@@ -113,6 +120,7 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
     }
 
     fn next(&mut self) -> Result<()> {
+        // only move when the iterator is valid and not errored
         if self.has_errored {
             bail!("the iterator is tainted");
         }
@@ -124,6 +132,7 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
         }
         Ok(())
     }
+
     fn num_active_iterators(&self) -> usize {
         self.iter.num_active_iterators()
     }

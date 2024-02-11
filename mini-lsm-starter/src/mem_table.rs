@@ -1,5 +1,3 @@
-#![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
-
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
@@ -50,9 +48,9 @@ impl MemTable {
     /// Create a new mem-table with WAL
     pub fn create_with_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
+            id,
             map: Arc::new(SkipMap::new()),
             wal: Some(Wal::create(path.as_ref())?),
-            id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -61,8 +59,8 @@ impl MemTable {
     pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
         let map = Arc::new(SkipMap::new());
         Ok(Self {
-            wal: Some(Wal::recover(path.as_ref(), &map)?),
             id,
+            wal: Some(Wal::recover(path.as_ref(), &map)?),
             map,
             approximate_size: Arc::new(AtomicUsize::new(0)),
         })
@@ -156,9 +154,6 @@ type SkipMapRangeIter<'a> =
 /// chapter for more information.
 ///
 /// This is part of week 1, day 2.
-///
-/// 在Rust中，特别是在使用#[self_referencing]宏定义自引用结构体时，'this是一个特殊的生命周期标记，用于指代整个结构体实例的生命周期。这种标记允许开发者在结构体定义中创建字段，这些字段的生命周期依赖于整个结构体实例的生命周期，而不是仅依赖于其他参数或返回值的生命周期。
-
 #[self_referencing]
 pub struct MemTableIterator {
     /// Stores a reference to the skipmap.
@@ -166,11 +161,11 @@ pub struct MemTableIterator {
     /// Stores a skipmap iterator that refers to the lifetime of `MemTableIterator` itself.
     #[borrows(map)]
     #[not_covariant]
-    //#[not_covariant]属性用于自引用结构体字段的声明中，特别是在使用#[self_referencing]宏时。这个属性的作用是指示编译器对特定字段的生命周期进行非协变（non-covariant）处理
-    iter: SkipMapRangeIter<'this>, //在Rust中，特别是在使用#[self_referencing]宏定义自引用结构体时，'this是一个特殊的生命周期标记，用于指代整个结构体实例的生命周期。这种标记允许开发者在结构体定义中创建字段，这些字段的生命周期依赖于整个结构体实例的生命周期，而不是仅依赖于其他参数或返回值的生命周期。
+    iter: SkipMapRangeIter<'this>,
     /// Stores the current key-value pair.
     item: (Bytes, Bytes),
 }
+
 impl MemTableIterator {
     fn entry_to_item(entry: Option<Entry<'_, Bytes, Bytes>>) -> (Bytes, Bytes) {
         entry
@@ -178,6 +173,7 @@ impl MemTableIterator {
             .unwrap_or_else(|| (Bytes::from_static(&[]), Bytes::from_static(&[])))
     }
 }
+
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
@@ -194,7 +190,6 @@ impl StorageIterator for MemTableIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        // with_iter_mut方法（由#[self_referencing]宏提供, 来安全地访问并修改iter字段，然后更新item字段以反映新的当前条目。
         let entry = self.with_iter_mut(|iter| MemTableIterator::entry_to_item(iter.next()));
         self.with_mut(|x| *x.item = entry);
         Ok(())
