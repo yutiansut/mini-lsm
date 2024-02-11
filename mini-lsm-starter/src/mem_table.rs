@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
+use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 
@@ -37,18 +38,34 @@ pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
 
 impl MemTable {
     /// Create a new mem-table.
-    pub fn create(_id: usize) -> Self {
-        unimplemented!()
+    pub fn create(id: usize) -> Self {
+        Self {
+            id,
+            map: Arc::new(SkipMap::new()),
+            wal: None,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     /// Create a new mem-table with WAL
-    pub fn create_with_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create_with_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            map: Arc::new(SkipMap::new()),
+            wal: Some(Wal::create(path.as_ref())?),
+            id,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     /// Create a memtable from WAL
-    pub fn recover_from_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
+        let map = Arc::new(SkipMap::new());
+        Ok(Self {
+            wal: Some(Wal::recover(path.as_ref(), &map)?),
+            id,
+            map,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     pub fn for_testing_put_slice(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -68,16 +85,24 @@ impl MemTable {
     }
 
     /// Get a value by key.
-    pub fn get(&self, _key: &[u8]) -> Option<Bytes> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+        self.map.get(key).map(|e| e.value().clone())
     }
 
     /// Put a key-value pair into the mem-table.
     ///
     /// In week 1, day 1, simply put the key-value pair into the skipmap.
     /// In week 2, day 6, also flush the data to WAL.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let estimated_size = key.len() + value.len();
+        self.map
+            .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+        self.approximate_size
+            .fetch_add(estimated_size, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ref wal) = self.wal {
+            wal.put(key, value)?;
+        }
+        Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {
@@ -88,13 +113,25 @@ impl MemTable {
     }
 
     /// Get an iterator over a range of keys.
-    pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
-        unimplemented!()
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator {
+        let (lower, upper) = (map_bound(lower), map_bound(upper));
+        let mut iter = MemTableIteratorBuilder {
+            map: self.map.clone(),
+            iter_builder: |map| map.range((lower, upper)),
+            item: (Bytes::new(), Bytes::new()),
+        }
+        .build();
+        let entry = iter.with_iter_mut(|iter| MemTableIterator::entry_to_item(iter.next()));
+        iter.with_mut(|x| *x.item = entry);
+        iter
     }
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
-    pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
-        unimplemented!()
+    pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
+        for entry in self.map.iter() {
+            builder.add(KeySlice::from_slice(&entry.key()[..]), &entry.value()[..]);
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> usize {
@@ -119,6 +156,9 @@ type SkipMapRangeIter<'a> =
 /// chapter for more information.
 ///
 /// This is part of week 1, day 2.
+///
+/// 在Rust中，特别是在使用#[self_referencing]宏定义自引用结构体时，'this是一个特殊的生命周期标记，用于指代整个结构体实例的生命周期。这种标记允许开发者在结构体定义中创建字段，这些字段的生命周期依赖于整个结构体实例的生命周期，而不是仅依赖于其他参数或返回值的生命周期。
+
 #[self_referencing]
 pub struct MemTableIterator {
     /// Stores a reference to the skipmap.
@@ -126,27 +166,37 @@ pub struct MemTableIterator {
     /// Stores a skipmap iterator that refers to the lifetime of `MemTableIterator` itself.
     #[borrows(map)]
     #[not_covariant]
-    iter: SkipMapRangeIter<'this>,
+    //#[not_covariant]属性用于自引用结构体字段的声明中，特别是在使用#[self_referencing]宏时。这个属性的作用是指示编译器对特定字段的生命周期进行非协变（non-covariant）处理
+    iter: SkipMapRangeIter<'this>, //在Rust中，特别是在使用#[self_referencing]宏定义自引用结构体时，'this是一个特殊的生命周期标记，用于指代整个结构体实例的生命周期。这种标记允许开发者在结构体定义中创建字段，这些字段的生命周期依赖于整个结构体实例的生命周期，而不是仅依赖于其他参数或返回值的生命周期。
     /// Stores the current key-value pair.
     item: (Bytes, Bytes),
 }
-
+impl MemTableIterator {
+    fn entry_to_item(entry: Option<Entry<'_, Bytes, Bytes>>) -> (Bytes, Bytes) {
+        entry
+            .map(|x| (x.key().clone(), x.value().clone()))
+            .unwrap_or_else(|| (Bytes::from_static(&[]), Bytes::from_static(&[])))
+    }
+}
 impl StorageIterator for MemTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.borrow_item().1[..]
     }
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        KeySlice::from_slice(&self.borrow_item().0[..])
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.borrow_item().0.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        // with_iter_mut方法（由#[self_referencing]宏提供, 来安全地访问并修改iter字段，然后更新item字段以反映新的当前条目。
+        let entry = self.with_iter_mut(|iter| MemTableIterator::entry_to_item(iter.next()));
+        self.with_mut(|x| *x.item = entry);
+        Ok(())
     }
 }
