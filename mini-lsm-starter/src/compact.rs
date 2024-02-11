@@ -74,6 +74,7 @@ impl CompactionController {
         task: &CompactionTask,
         output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
+        println!("task {:#?}", task);
         match (self, task) {
             (CompactionController::Leveled(ctrl), CompactionTask::Leveled(task)) => {
                 ctrl.apply_compaction_result(snapshot, task, output)
@@ -84,6 +85,7 @@ impl CompactionController {
             (CompactionController::Tiered(ctrl), CompactionTask::Tiered(task)) => {
                 ctrl.apply_compaction_result(snapshot, task, output)
             }
+
             _ => unreachable!(),
         }
     }
@@ -250,9 +252,12 @@ impl LsmStorageInner {
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
+        // 功能和流程
+        // 检查压缩选项：首先，通过模式匹配检查self.options.compaction_options是否为CompactionOptions::NoCompaction。如果不是，函数将panic，因为该函数仅在未启用压缩的情况下被允许调用。
         let CompactionOptions::NoCompaction = self.options.compaction_options else {
             panic!("full compaction can only be called with compaction is not enabled")
         };
+        // 获取快照：然后，从当前状态（self.state）获取数据库的快照，包括L0层和L1层的SSTable信息。
 
         let snapshot = {
             let state = self.state.read();
@@ -261,15 +266,19 @@ impl LsmStorageInner {
 
         let l0_sstables = snapshot.l0_sstables.clone();
         let l1_sstables = snapshot.levels[0].1.clone();
+        // 创建压缩任务：基于L0和L1层的SSTable信息，创建一个CompactionTask::ForceFullCompaction任务。
+
         let compaction_task = CompactionTask::ForceFullCompaction {
             l0_sstables: l0_sstables.clone(),
             l1_sstables: l1_sstables.clone(),
         };
 
         println!("force full compaction: {:?}", compaction_task);
-
+        // 执行压缩：调用compact方法执行压缩任务，并获取压缩后的新SSTable信息。
         let sstables = self.compact(&compaction_task)?;
         let mut ids = Vec::with_capacity(sstables.len());
+
+        // 更新状态：在持有状态锁的情况下，更新数据库状态，包括移除旧的SSTables并添加新的SSTables。同时更新L0和L1层的SSTable信息。
 
         {
             let state_lock = self.state_lock.lock();
@@ -300,6 +309,8 @@ impl LsmStorageInner {
                 ManifestRecord::Compaction(compaction_task, ids.clone()),
             )?;
         }
+
+        // 同步目录和清理：同步目录状态到磁盘，并通过Manifest记录压缩操作。最后，删除所有参与压缩的旧SSTable文件。
         for sst in l0_sstables.iter().chain(l1_sstables.iter()) {
             std::fs::remove_file(self.path_of_sst(*sst))?;
         }
