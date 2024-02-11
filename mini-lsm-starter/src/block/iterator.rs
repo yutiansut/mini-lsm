@@ -38,11 +38,11 @@ impl Block {
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
         Self {
-            block,
             key: KeyVec::new(),
+            first_key: block.get_first_key(),
+            block,
             value_range: (0, 0),
             idx: 0,
-            first_key: KeyVec::new(),
         }
     }
 
