@@ -30,7 +30,7 @@ struct Args {
     path: PathBuf,
     #[arg(long, default_value = "leveled")]
     compaction: CompactionStrategy,
-    #[arg(long)]
+    #[arg(long, default_value = "true")]
     enable_wal: bool,
     #[arg(long)]
     serializable: bool,
@@ -57,6 +57,14 @@ impl ReplHandler {
                     end - begin + 1,
                     self.epoch
                 );
+            }
+            Command::Put { key, value } => {
+
+                self.lsm.put(
+                    format!("{}", key).as_bytes(),
+                    format!("value{}@{}", value, self.epoch).as_bytes(),
+                )?;
+
             }
             Command::Del { key } => {
                 self.lsm.delete(key.as_bytes())?;
@@ -146,7 +154,10 @@ enum Command {
         begin: Option<String>,
         end: Option<String>,
     },
-
+    Put {
+        key: String,
+        value: String
+    },
     Dump,
     Flush,
     FullCompaction,
@@ -185,7 +196,16 @@ impl Command {
                 },
             )(i)
         };
-
+        
+        let put = |i| {
+            map(
+                tuple((tag_no_case("put"), space1, string, space1, string)),
+                |(_, _, key, _, value)| Command::Put {
+                    key: key,
+                    value: value,
+                },
+            )(i)
+        };
         let del = |i| {
             map(
                 tuple((tag_no_case("del"), space1, string)),
@@ -220,6 +240,7 @@ impl Command {
                 del,
                 get,
                 scan,
+                put,
                 map(tag_no_case("dump"), |_| Command::Dump),
                 map(tag_no_case("flush"), |_| Command::Flush),
                 map(tag_no_case("full_compaction"), |_| Command::FullCompaction),
